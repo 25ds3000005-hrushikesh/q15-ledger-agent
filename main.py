@@ -45,7 +45,7 @@ def load_orders():
     with path.open("r", encoding="utf-8-sig") as file:
         records = json.load(file)
 
-    # Keep only the latest version of every order ID.
+    # Keep the latest updated record for each order ID.
     latest = {}
 
     for order in records:
@@ -79,8 +79,11 @@ def interpret(question):
         "currency": "USD",
     }
 
-    # Identify the requested metric.
-    if any(word in text for word in ("refund", "refunded")):
+    # Identify the metric. Check average before total revenue.
+    if re.search(r"\b(average|avg|mean)\b", text):
+        q["metric"] = "average"
+
+    elif any(word in text for word in ("refund", "refunded")):
         q["metric"] = "refunds"
 
     elif any(
@@ -127,14 +130,13 @@ def interpret(question):
     ):
         q["metric"] = "products"
 
-    # Identify the currency.
+    # Identify requested currency.
     for currency in RATES:
         if re.search(rf"\b{currency.lower()}\b", text):
             q["currency"] = currency
             break
 
-    # IMPORTANT: Check "from ... region" before "in ... region".
-    # This prevents "USD from the North" being treated as a region.
+    # Identify region without accidentally capturing the currency.
     patterns = [
         r"\bfrom\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
         r"\bin\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
@@ -146,8 +148,6 @@ def interpret(question):
         if match:
             region = match.group(1).strip()
 
-            # Reject captures that accidentally include currency or
-            # connecting words from earlier in the question.
             if not re.search(
                 r"\b(?:usd|eur|inr|from|into|with)\b",
                 region,
@@ -155,13 +155,12 @@ def interpret(question):
                 q["region"] = region
                 break
 
-    # Identify calendar-month date ranges.
+    # Identify calendar month and its exclusive end date.
     for month, number in MONTHS.items():
         match = re.search(rf"\b{month}\s+(20\d{{2}})\b", text)
 
         if match:
             year = int(match.group(1))
-
             q["start_date"] = f"{year:04d}-{number:02d}-01"
 
             if number == 12:
@@ -174,6 +173,16 @@ def interpret(question):
     return q
 
 
+def money_in_currency(order, currency):
+    original_currency = order["currency"].upper()
+
+    return (
+        Decimal(str(order["amount"]))
+        * RATES[original_currency]
+        / RATES[currency]
+    )
+
+
 def answer_question(question):
     q = interpret(question)
     metric = q["metric"]
@@ -184,20 +193,20 @@ def answer_question(question):
     for order in ORDERS:
         status = order["status"].lower()
 
-        # Revenue includes paid orders only.
-        if metric == "revenue" and status != "paid":
+        # Revenue and average paid order value use paid orders only.
+        if metric in ("revenue", "average") and status != "paid":
             continue
 
-        # Refunds include orders currently marked refunded.
+        # Refund total uses currently refunded orders.
         if metric == "refunds" and status != "refunded":
             continue
 
-        # Filter by region when specified.
+        # Filter by region.
         if q["region"]:
-            if order["region"].strip().lower() != q["region"].strip().lower():
+            if order["region"].strip().lower() != q["region"]:
                 continue
 
-        # Business dates are based on Asia/Kolkata.
+        # Business dates use Asia/Kolkata.
         created = (
             parse_time(order["created_at"])
             .astimezone(TZ)
@@ -213,15 +222,29 @@ def answer_question(question):
 
         rows.append(order)
 
-    # Calculate money in the requested currency.
+    # Average value per paid order, not the total.
+    if metric == "average":
+        if not rows:
+            return 0
+
+        total = sum(
+            (money_in_currency(order, currency) for order in rows),
+            Decimal("0"),
+        )
+
+        average = total / Decimal(len(rows))
+
+        return float(
+            average.quantize(
+                Decimal("0.01"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+
+    # Revenue and refund totals.
     if metric in ("revenue", "refunds"):
         total = sum(
-            (
-                Decimal(str(order["amount"]))
-                * RATES[order["currency"].upper()]
-                / RATES[currency]
-                for order in rows
-            ),
+            (money_in_currency(order, currency) for order in rows),
             Decimal("0"),
         )
 
@@ -259,8 +282,7 @@ def health():
 @app.post("/")
 def ask(body: Question):
     try:
-        answer = answer_question(body.question)
-        return {"answer": answer}
+        return {"answer": answer_question(body.question)}
 
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(
