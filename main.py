@@ -4,16 +4,14 @@ import re
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 app = FastAPI(title="Acme Ledger Agent")
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-MODEL = "gemma3:1b-it-qat"
-
+TZ = ZoneInfo("Asia/Kolkata")
 RATES = {
     "USD": Decimal("1"),
     "EUR": Decimal("1.14"),
@@ -27,7 +25,7 @@ def parse_time(value):
 
 def load_orders():
     path = Path(__file__).parent / "all-orders.json"
-    with path.open("r", encoding="utf-8-sig") as f:
+    with path.open(encoding="utf-8-sig") as f:
         records = json.load(f)
 
     latest = {}
@@ -39,7 +37,6 @@ def load_orders():
             > parse_time(latest[oid]["updated_at"])
         ):
             latest[oid] = order
-
     return list(latest.values())
 
 
@@ -50,73 +47,85 @@ class Question(BaseModel):
     question: str
 
 
+MONTHS = {
+    "january": 1, "february": 2, "march": 3,
+    "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
+}
+
+
 def interpret(question):
-    prompt = f"""
-Convert the user's ledger question into JSON only.
-Allowed fields:
-metric: revenue, refunds, order_count, quantity, customers, products
-region: string or null
-product: string or null
-customer: string or null
-status: string or null
-start_date: YYYY-MM-DD or null
-end_date: YYYY-MM-DD or null (exclusive)
-currency: USD, EUR, INR or null
-group_by: region, product, customer, month or null
+    text = question.lower()
+    q = {
+        "metric": "revenue",
+        "region": None,
+        "product": None,
+        "customer": None,
+        "start_date": None,
+        "end_date": None,
+        "currency": "USD",
+    }
 
-Rules:
-- "revenue" means the sum of amounts for paid orders only.
-- "refunds" means the sum of amounts for orders whose current status is refunded.
-- Use created_at for date filters.
-- Interpret month names as calendar months.
-- Do not invent filters. Use null when absent.
-- Return valid JSON, without Markdown fences or explanations.
+    if any(x in text for x in ("refund", "refunded")):
+        q["metric"] = "refunds"
+    elif "customer" in text and any(
+        x in text for x in ("how many", "number of", "count")
+    ):
+        q["metric"] = "customers"
+    elif "product" in text and any(
+        x in text for x in ("how many", "number of", "count")
+    ):
+        q["metric"] = "products"
+    elif any(x in text for x in ("how many orders", "order count", "number of orders")):
+        q["metric"] = "order_count"
+    elif any(x in text for x in ("quantity", "units sold", "how many units")):
+        q["metric"] = "quantity"
 
-Question: {question}
-"""
-    response = requests.post(
-        OLLAMA_URL,
-        json={"model": MODEL, "prompt": prompt, "stream": False,
-              "format": "json"},
-        timeout=12,
-    )
-    response.raise_for_status()
-    text = response.json()["response"]
-    match = re.search(r"\{.*\}", text, re.S)
-    if not match:
-        raise ValueError("Model did not return JSON")
-    return json.loads(match.group())
+    for currency in RATES:
+        if re.search(rf"\b{currency.lower()}\b", text):
+            q["currency"] = currency
+            break
+
+    match = re.search(r"\b(?:in|from)\s+([a-z][a-z0-9 -]*?)\s+region\b", text)
+    if match:
+        q["region"] = match.group(1).strip()
+
+    for month, number in MONTHS.items():
+        match = re.search(rf"\b{month}\s+(20\d{{2}})\b", text)
+        if match:
+            year = int(match.group(1))
+            q["start_date"] = f"{year:04d}-{number:02d}-01"
+            if number == 12:
+                q["end_date"] = f"{year + 1:04d}-01-01"
+            else:
+                q["end_date"] = f"{year:04d}-{number + 1:02d}-01"
+            break
+
+    return q
 
 
 def answer_question(question):
     q = interpret(question)
-    metric = q.get("metric") or "revenue"
-    currency = (q.get("currency") or "USD").upper()
-
-    if currency not in RATES:
-        currency = "USD"
-
+    metric = q["metric"]
+    currency = q["currency"]
     rows = []
+
     for order in ORDERS:
-        if metric == "revenue" and order["status"] != "paid":
+        status = order["status"].lower()
+
+        if metric == "revenue" and status != "paid":
             continue
-        if metric == "refunds" and order["status"] != "refunded":
+        if metric == "refunds" and status != "refunded":
             continue
 
-        if q.get("region") and order["region"].lower() != q["region"].lower():
-            continue
-        if q.get("product") and order["product"].lower() != q["product"].lower():
-            continue
-        if q.get("customer") and order["customer"].lower() != q["customer"].lower():
-            continue
-        if q.get("status") and order["status"].lower() != q["status"].lower():
+        if q["region"] and order["region"].lower() != q["region"]:
             continue
 
-        # Business dates are interpreted in Asia/Kolkata.
-        created = parse_time(order["created_at"]).astimezone().date().isoformat()
-        if q.get("start_date") and created < q["start_date"]:
+        created = parse_time(order["created_at"]).astimezone(TZ).date().isoformat()
+        if q["start_date"] and created < q["start_date"]:
             continue
-        if q.get("end_date") and created >= q["end_date"]:
+        if q["end_date"] and created >= q["end_date"]:
             continue
 
         rows.append(order)
@@ -125,7 +134,7 @@ def answer_question(question):
         total = sum(
             (
                 Decimal(str(row["amount"]))
-                * RATES.get(row["currency"], Decimal("1"))
+                * RATES[row["currency"]]
                 / RATES[currency]
                 for row in rows
             ),
@@ -142,7 +151,7 @@ def answer_question(question):
     if metric == "products":
         return len({row["product"] for row in rows})
 
-    raise ValueError(f"Unsupported metric: {metric}")
+    raise ValueError("Unsupported metric")
 
 
 @app.get("/")
@@ -153,9 +162,6 @@ def health():
 @app.post("/")
 def ask(body: Question):
     try:
-        answer = answer_question(body.question)
-        return {"answer": answer}
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=503, detail=f"Ollama error: {exc}")
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(status_code=422, detail=f"Could not answer question: {exc}")
+        return {"answer": answer_question(body.question)}
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
