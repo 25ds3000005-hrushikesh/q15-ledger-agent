@@ -20,18 +20,10 @@ RATES = {
 }
 
 MONTHS = {
-    "january": 1,
-    "february": 2,
-    "march": 3,
-    "april": 4,
-    "may": 5,
-    "june": 6,
-    "july": 7,
-    "august": 8,
-    "september": 9,
-    "october": 10,
-    "november": 11,
-    "december": 12,
+    "january": 1, "february": 2, "march": 3,
+    "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9,
+    "october": 10, "november": 11, "december": 12,
 }
 
 
@@ -42,26 +34,28 @@ def parse_time(value):
 def load_orders():
     path = Path(__file__).parent / "all-orders.json"
 
-    with path.open("r", encoding="utf-8-sig") as file:
-        records = json.load(file)
+    with path.open("r", encoding="utf-8-sig") as f:
+        records = json.load(f)
 
-    # Keep the latest updated record for each order ID.
     latest = {}
-
     for order in records:
-        order_id = order["id"]
-
+        oid = order["id"]
         if (
-            order_id not in latest
+            oid not in latest
             or parse_time(order["updated_at"])
-            > parse_time(latest[order_id]["updated_at"])
+            > parse_time(latest[oid]["updated_at"])
         ):
-            latest[order_id] = order
+            latest[oid] = order
 
     return list(latest.values())
 
 
 ORDERS = load_orders()
+PRODUCTS = sorted(
+    {str(order["product"]) for order in ORDERS},
+    key=len,
+    reverse=True,
+)
 
 
 class Question(BaseModel):
@@ -74,25 +68,33 @@ def interpret(question):
     q = {
         "metric": "revenue",
         "region": None,
+        "product": None,
         "start_date": None,
         "end_date": None,
         "currency": "USD",
     }
 
-    # Identify the metric. Check average before total revenue.
-    if re.search(r"\b(average|avg|mean)\b", text):
+    # Identify the metric.
+    if (
+        "distinct customer" in text
+        or "unique customer" in text
+        or "different customers" in text
+        or "how many customers" in text
+        or "number of customers" in text
+    ):
+        q["metric"] = "customers"
+
+    elif re.search(r"\b(average|avg|mean)\b", text):
         q["metric"] = "average"
 
-    elif any(word in text for word in ("refund", "refunded")):
+    elif "refund" in text:
         q["metric"] = "refunds"
 
     elif any(
         phrase in text
         for phrase in (
-            "how many orders",
-            "number of orders",
-            "order count",
-            "count orders",
+            "how many orders", "number of orders",
+            "order count", "count orders",
         )
     ):
         q["metric"] = "order_count"
@@ -100,10 +102,8 @@ def interpret(question):
     elif any(
         phrase in text
         for phrase in (
-            "how many units",
-            "units sold",
-            "total quantity",
-            "quantity",
+            "how many units", "units sold",
+            "total quantity", "quantity",
         )
     ):
         q["metric"] = "quantity"
@@ -111,32 +111,25 @@ def interpret(question):
     elif any(
         phrase in text
         for phrase in (
-            "number of customers",
-            "how many customers",
-            "count customers",
-            "unique customers",
-        )
-    ):
-        q["metric"] = "customers"
-
-    elif any(
-        phrase in text
-        for phrase in (
-            "number of products",
-            "how many products",
-            "count products",
-            "unique products",
+            "how many products", "number of products",
+            "unique products", "count products",
         )
     ):
         q["metric"] = "products"
 
-    # Identify requested currency.
+    # Currency.
     for currency in RATES:
         if re.search(rf"\b{currency.lower()}\b", text):
             q["currency"] = currency
             break
 
-    # Identify region without accidentally capturing the currency.
+    # Product names are taken from the actual dataset.
+    for product in PRODUCTS:
+        if product.lower() in text:
+            q["product"] = product
+            break
+
+    # Region: examples "from the North region", "in East region".
     patterns = [
         r"\bfrom\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
         r"\bin\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
@@ -144,7 +137,6 @@ def interpret(question):
 
     for pattern in patterns:
         match = re.search(pattern, text)
-
         if match:
             region = match.group(1).strip()
 
@@ -155,7 +147,7 @@ def interpret(question):
                 q["region"] = region
                 break
 
-    # Identify calendar month and its exclusive end date.
+    # Calendar month boundaries.
     for month, number in MONTHS.items():
         match = re.search(rf"\b{month}\s+(20\d{{2}})\b", text)
 
@@ -174,11 +166,10 @@ def interpret(question):
 
 
 def money_in_currency(order, currency):
-    original_currency = order["currency"].upper()
-
+    original = order["currency"].upper()
     return (
         Decimal(str(order["amount"]))
-        * RATES[original_currency]
+        * RATES[original]
         / RATES[currency]
     )
 
@@ -187,24 +178,39 @@ def answer_question(question):
     q = interpret(question)
     metric = q["metric"]
     currency = q["currency"]
-
     rows = []
 
     for order in ORDERS:
         status = order["status"].lower()
 
-        # Revenue and average paid order value use paid orders only.
+        # These metrics use paid orders only.
         if metric in ("revenue", "average") and status != "paid":
             continue
 
-        # Refund total uses currently refunded orders.
+        # Refunds use orders currently marked refunded.
         if metric == "refunds" and status != "refunded":
             continue
 
-        # Filter by region.
-        if q["region"]:
-            if order["region"].strip().lower() != q["region"]:
-                continue
+        # Customer-count questions explicitly saying paid orders only.
+        text = question.lower()
+        if (
+            metric == "customers"
+            and "paid orders only" in text
+            and status != "paid"
+        ):
+            continue
+
+        if (
+            q["region"]
+            and order["region"].strip().lower() != q["region"].lower()
+        ):
+            continue
+
+        if (
+            q["product"]
+            and order["product"].strip().lower() != q["product"].lower()
+        ):
+            continue
 
         # Business dates use Asia/Kolkata.
         created = (
@@ -222,7 +228,23 @@ def answer_question(question):
 
         rows.append(order)
 
-    # Average value per paid order, not the total.
+    # Distinct customers.
+    if metric == "customers":
+        return len({order["customer"] for order in rows})
+
+    # Distinct products.
+    if metric == "products":
+        return len({order["product"] for order in rows})
+
+    # Order count.
+    if metric == "order_count":
+        return len(rows)
+
+    # Total quantity.
+    if metric == "quantity":
+        return sum(int(order["qty"]) for order in rows)
+
+    # Average paid order value.
     if metric == "average":
         if not rows:
             return 0
@@ -231,17 +253,13 @@ def answer_question(question):
             (money_in_currency(order, currency) for order in rows),
             Decimal("0"),
         )
-
-        average = total / Decimal(len(rows))
+        result = total / Decimal(len(rows))
 
         return float(
-            average.quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP,
-            )
+            result.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         )
 
-    # Revenue and refund totals.
+    # Revenue or refund total.
     if metric in ("revenue", "refunds"):
         total = sum(
             (money_in_currency(order, currency) for order in rows),
@@ -249,23 +267,8 @@ def answer_question(question):
         )
 
         return float(
-            total.quantize(
-                Decimal("0.01"),
-                rounding=ROUND_HALF_UP,
-            )
+            total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         )
-
-    if metric == "order_count":
-        return len(rows)
-
-    if metric == "quantity":
-        return sum(int(order["qty"]) for order in rows)
-
-    if metric == "customers":
-        return len({order["customer"] for order in rows})
-
-    if metric == "products":
-        return len({order["product"] for order in rows})
 
     raise ValueError("Unsupported metric")
 
@@ -283,7 +286,6 @@ def health():
 def ask(body: Question):
     try:
         return {"answer": answer_question(body.question)}
-
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
