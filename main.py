@@ -1,4 +1,4 @@
-```python
+
 import json
 import re
 from datetime import datetime
@@ -267,4 +267,3 @@ def ask(body: Question):
             status_code=422,
             detail=f"Could not answer question: {exc}",
         )
-```
