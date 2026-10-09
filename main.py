@@ -1,4 +1,4 @@
-
+```python
 import json
 import re
 from datetime import datetime
@@ -45,7 +45,7 @@ def load_orders():
     with path.open("r", encoding="utf-8-sig") as file:
         records = json.load(file)
 
-    # Keep the latest version of each order.
+    # Keep only the latest version of every order ID.
     latest = {}
 
     for order in records:
@@ -70,6 +70,7 @@ class Question(BaseModel):
 
 def interpret(question):
     text = question.lower()
+
     q = {
         "metric": "revenue",
         "region": None,
@@ -79,8 +80,9 @@ def interpret(question):
     }
 
     # Identify the requested metric.
-    if "refund" in text:
+    if any(word in text for word in ("refund", "refunded")):
         q["metric"] = "refunds"
+
     elif any(
         phrase in text
         for phrase in (
@@ -91,16 +93,18 @@ def interpret(question):
         )
     ):
         q["metric"] = "order_count"
+
     elif any(
         phrase in text
         for phrase in (
-            "quantity",
-            "units sold",
             "how many units",
+            "units sold",
             "total quantity",
+            "quantity",
         )
     ):
         q["metric"] = "quantity"
+
     elif any(
         phrase in text
         for phrase in (
@@ -111,6 +115,7 @@ def interpret(question):
         )
     ):
         q["metric"] = "customers"
+
     elif any(
         phrase in text
         for phrase in (
@@ -122,43 +127,47 @@ def interpret(question):
     ):
         q["metric"] = "products"
 
-    # Identify currency.
+    # Identify the currency.
     for currency in RATES:
         if re.search(rf"\b{currency.lower()}\b", text):
             q["currency"] = currency
             break
 
-    # Identify a region from phrases like:
-    # "from the North region", "in North region".
-    match = re.search(
-        r"\b(?:in|from)\s+(?:the\s+)?"
-        r"([a-z][a-z0-9 -]*?)\s+region\b",
-        text,
-    )
+    # IMPORTANT: Check "from ... region" before "in ... region".
+    # This prevents "USD from the North" being treated as a region.
+    patterns = [
+        r"\bfrom\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
+        r"\bin\s+(?:the\s+)?([a-z][a-z -]*?)\s+region\b",
+    ]
 
-    if match:
-        q["region"] = match.group(1).strip()
+    for pattern in patterns:
+        match = re.search(pattern, text)
 
-    # Identify calendar months.
+        if match:
+            region = match.group(1).strip()
+
+            # Reject captures that accidentally include currency or
+            # connecting words from earlier in the question.
+            if not re.search(
+                r"\b(?:usd|eur|inr|from|into|with)\b",
+                region,
+            ):
+                q["region"] = region
+                break
+
+    # Identify calendar-month date ranges.
     for month, number in MONTHS.items():
-        match = re.search(
-            rf"\b{month}\s+(20\d{{2}})\b",
-            text,
-        )
+        match = re.search(rf"\b{month}\s+(20\d{{2}})\b", text)
 
         if match:
             year = int(match.group(1))
 
-            q["start_date"] = (
-                f"{year:04d}-{number:02d}-01"
-            )
+            q["start_date"] = f"{year:04d}-{number:02d}-01"
 
             if number == 12:
                 q["end_date"] = f"{year + 1:04d}-01-01"
             else:
-                q["end_date"] = (
-                    f"{year:04d}-{number + 1:02d}-01"
-                )
+                q["end_date"] = f"{year:04d}-{number + 1:02d}-01"
 
             break
 
@@ -179,18 +188,16 @@ def answer_question(question):
         if metric == "revenue" and status != "paid":
             continue
 
-        # Refund totals include currently refunded orders.
+        # Refunds include orders currently marked refunded.
         if metric == "refunds" and status != "refunded":
             continue
 
-        if (
-            q["region"]
-            and order["region"].strip().lower()
-            != q["region"].strip().lower()
-        ):
-            continue
+        # Filter by region when specified.
+        if q["region"]:
+            if order["region"].strip().lower() != q["region"].strip().lower():
+                continue
 
-        # Business dates use Asia/Kolkata.
+        # Business dates are based on Asia/Kolkata.
         created = (
             parse_time(order["created_at"])
             .astimezone(TZ)
@@ -206,6 +213,7 @@ def answer_question(question):
 
         rows.append(order)
 
+    # Calculate money in the requested currency.
     if metric in ("revenue", "refunds"):
         total = sum(
             (
@@ -242,6 +250,7 @@ def answer_question(question):
 @app.get("/")
 def health():
     return {
+        "service": "Acme Appliances order ledger",
         "status": "running",
         "unique_orders": len(ORDERS),
     }
@@ -250,9 +259,12 @@ def health():
 @app.post("/")
 def ask(body: Question):
     try:
-        return {"answer": answer_question(body.question)}
+        answer = answer_question(body.question)
+        return {"answer": answer}
+
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(
             status_code=422,
             detail=f"Could not answer question: {exc}",
         )
+```
